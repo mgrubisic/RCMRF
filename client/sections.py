@@ -19,6 +19,7 @@ class Sections:
         """
         self.sections = sections
         self.materials = materials
+        self.UBIG = 1.0e10
 
     def rot_spring_2d_modIKmodel(self, eleID, nodeR, nodeC, K, asPos, asNeg, MyPos, MyNeg, LS, LK, LA, LD, cS, cK, cA,
                                  cD, th_pP, th_pN, th_pcP, th_pcN, ResP, ResN, th_uP, th_uN, DP, DN):
@@ -154,39 +155,52 @@ class Sections:
             except TypeError:
                 print('[EXCEPTION] Node ID not provided')
 
-    def hysteretic_hinges(self, ele, transfTag):
+    def hysteretic_hinges(self, et, iNode, jNode, ele, transfTag, flag3d):
         """
         Creates hysteretic hinges
+        :param et: int                              Element tag
         :param ele: DataFrame                       Hinge model parameters
         :param transfTag: int                       Element transformation tag
+        :param flag3d: bool                         True for 3D modelling, False for 2D modelling
         :return: None
         """
-        # Bay and storey levels
-        bay = ele['Bay']
-        st = ele['Storey']
         # Cross-section area of the element
         area = ele['b'] * ele['h']
         # Moment of inertia of the cross-section
         iz = ele['b'] * ele['h'] ** 3 / 12
-        # Node IDs connecting the elements
-        if ele['Element'].lower() == 'beam':
-            eleTag = f"1{bay}{st}"
-            iNode = int(f"{bay}{st}")
-            jNode = int(f"{bay + 1}{st}")
+        # Secondary moment of inertia
+        iy = ele['h'] * ele['b'] ** 3 / 12
+        # Shear parameters
+        nu = 0.2
+        Gc = float(self.materials['Ec']) * 1000.0 / 2.0 / (1 + nu)
+        # Torsional moment of inertia
+        if ele["h"] >= ele["b"]:
+            J = ele["b"] * ele["h"]**3 * (16 / 3 - 3.36 * ele["h"] / ele["b"] * (1 - 1 / 12 * (ele["h"] / ele["b"])**4))
         else:
-            eleTag = f"2{bay}{st}"
-            iNode = int(f"{bay}{st - 1}")
-            jNode = int(f"{bay}{st}")
+            J = ele["h"] * ele["b"]**3 * (16 / 3 - 3.36 * ele["b"] / ele["h"] * (1 - 1 / 12 * (ele["b"] / ele["h"])**4))
+
+        # Node IDs connecting the elements
+        if not flag3d:
+            # Bay and storey levels
+            bay = ele['Bay']
+            st = ele['Storey']
+
+            if ele['Element'].lower() == 'beam':
+                iNode = int(f"{bay}{st}")
+                jNode = int(f"{bay + 1}{st}")
+            else:
+                iNode = int(f"{bay}{st - 1}")
+                jNode = int(f"{bay}{st}")
 
         # Material tags
-        matTag1 = int('101' + eleTag)
-        matTag2 = int('102' + eleTag)
-        intTag = int('105' + eleTag)
-        phTag1 = int('106' + eleTag)
-        phTag2 = int('107' + eleTag)
+        matTag1 = int(f'101{et}')
+        matTag2 = int(f'102{et}')
+        intTag = int(f'105{et}')
+        phTag1 = int(f'106{et}')
+        phTag2 = int(f'107{et}')
 
         # Integration tag
-        integrationTag = int('108' + eleTag)
+        integrationTag = int(f'108{et}')
 
         # Some additional parameters for the hysteretic model
         pinchX = 0.8
@@ -204,8 +218,47 @@ class Sections:
                             -ele['phi3Neg'], pinchX, pinchY, damage1, damage2, beta)
 
         # Elastic section
-        op.section('Elastic', intTag, float(self.materials['Ec']) * 1000.0, area, iz)
+        if flag3d:
+            op.section('Elastic', intTag, float(self.materials['Ec']) * 1000.0, area, iy, iz, Gc, J)
+        else:
+            op.section('Elastic', intTag, float(self.materials['Ec']) * 1000.0, area, iz)
+
+        # Create the plastic hinge flexural section about ZZ
         op.section('Uniaxial', phTag1, matTag1, 'Mz')
         op.section('Uniaxial', phTag2, matTag2, 'Mz')
-        op.beamIntegration('HingeRadau', integrationTag, phTag1, ele['lp'], phTag2, ele['lp'], intTag)
-        op.element('forceBeamColumn', int(eleTag), iNode, jNode, transfTag, integrationTag)
+
+        if transfTag == 1 and flag3d:
+            # Transformation tag 1 refers to the columns
+            # Additional hinges are required for bidirectional response for the columns in the 3D model
+            # Since those are symmetrical square columns, i.e. designed to have the same properties along both principal
+            # directions, then the properties will match.
+            # TODO, add support for rectangular columns
+            # Additional tags for the materials
+            matTag3 = int(f'111{et}')
+            matTag4 = int(f'112{et}')
+            axialTag = int(f'113{et}')
+            aggTag1 = int(f"114{et}")
+            aggTag2 = int(f"115{et}")
+
+            # Beam integration
+            op.beamIntegration('HingeRadau', integrationTag, aggTag1, ele['lp'], aggTag2, ele['lp'], intTag)
+
+            # Create he plastic hinge axial material
+            op.uniaxialMaterial("Elastic", axialTag, float(self.materials['Ec']) * 1000.0 * area)
+
+            # Create the plastic hinge materials
+            op.uniaxialMaterial('Hysteretic', matTag3, ele['m1'], ele['phi1'], ele['m2'], ele['phi2'], ele['m3'],
+                                ele['phi3'], -ele['m1Neg'], -ele['phi1Neg'], -ele['m2Neg'], -ele['phi2Neg'],
+                                -ele['m3Neg'], -ele['phi3Neg'], pinchX, pinchY, damage1, damage2, beta)
+            op.uniaxialMaterial('Hysteretic', matTag4, ele['m1'], ele['phi1'], ele['m2'], ele['phi2'], ele['m3'],
+                                ele['phi3'], -ele['m1Neg'], -ele['phi1Neg'], -ele['m2Neg'], -ele['phi2Neg'],
+                                -ele['m3Neg'], -ele['phi3Neg'], pinchX, pinchY, damage1, damage2, beta)
+
+            # Aggregate P and Myy behaviour to Mzz behaviour
+            op.section("Aggregator", aggTag1, axialTag, "P", matTag3, "My", "-section", phTag1)
+            op.section("Aggregator", aggTag2, axialTag, "P", matTag4, "My", "-section", phTag2)
+        else:
+            # Beam integration
+            op.beamIntegration('HingeRadau', integrationTag, phTag1, ele['lp'], phTag2, ele['lp'], intTag)
+
+        op.element('forceBeamColumn', int(et), iNode, jNode, transfTag, integrationTag)

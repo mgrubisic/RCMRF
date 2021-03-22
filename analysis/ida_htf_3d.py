@@ -1,18 +1,20 @@
 """
 Incremental Dynamic Analysis using Hunt, Trace and Fill algorithm
-Object temporarily kept. Will be deleted later...
 """
 import openseespy.opensees as op
-import numpy as np, pandas as pd
+import numpy as np
+import pandas as pd
+import pickle
+import os
 from analysis.solutionAlgorithm import SolutionAlgorithm
 from analysis.static import Static
 from client.model import Model
 
 
-class IDA_HTF:
+class IDA_HTF_3D:
     def __init__(self, first_int, incr_step, max_runs, IM_type, T_info, xi, omegas, dt, dcap, nmsfile_x, nmsfile_y,
                  dts_file, durs_file, gm_dir, analysis_type, sections_file, loads_file, materials, system='Perimeter',
-                 hingeModel='Haselton', pflag=True, flag3d=False):
+                 hingeModel='Haselton', pflag=True, flag3d=False, export_at_each_step=False):
         """
         Initializes IDA
         :param first_int: float                     The first intensity to run the elastic run (e.g. 0.05g)
@@ -39,6 +41,7 @@ class IDA_HTF:
         :param analysis_type, sections_file, loads_file, materials, system, hingeModel: See client\model.py
         :param pflag: bool                          Whether print information on screen or not
         :param flag3d: bool                         True for 3D modelling, False for 2D modelling
+        :param export_at_each_step: bool            Export at each step, i.e. record-run
         """
         self.first_int = first_int
         self.incr_step = incr_step
@@ -64,6 +67,7 @@ class IDA_HTF:
         self.system = system
         self.pflag = pflag
         self.flag3d = flag3d
+        self.export_at_each_step = export_at_each_step
         self.PTAGX = 10
         self.PTAGY = 20
         self.TSTAGX = 51
@@ -106,12 +110,12 @@ class IDA_HTF:
         f.close()
         return data
 
-    def get_IM(self, eq, dt, T, xi):
+    def get_IM(self, eq, dt, period, xi):
         """
         Gets Sa(T) of a given record, for a specified value of period T using the Newmark Average Acceleration
         :param eq: str                              Filename which is a single column file in units of g (e.g. "Eq.txt")
         :param dt: float                            Time step in seconds (e.g. 0.01)
-        :param T: float                             Period in seconds (e.g. 1.0)
+        :param period: float                        Period in seconds (e.g. 1.0)
         :param xi: float                            Elastic damping (e.g. 0.05)
         :return: floats                             sa - pseudo-spectral acceleration in g
                                                     sv - pseudo-spectral velocity in m/s
@@ -121,7 +125,7 @@ class IDA_HTF:
         # Read the acceleration time series
         accg = self.read_text_file(eq, 0)
 
-        if T == 0.0:
+        if period == 0.0:
             pga = 0.0
             for i in range(len(accg)):
                 temp2 = abs(accg[i])
@@ -147,7 +151,7 @@ class IDA_HTF:
 
             # Calculate the initial values
             # Stiffness in N/m
-            k = ms * np.power(6.2832 / T, 2)
+            k = ms * np.power(6.2832 / period, 2)
             # Circular frequency
             w = np.power(k / ms, 0.5)
             # Damping coefficient
@@ -222,6 +226,9 @@ class IDA_HTF:
         :param fy: float                            Scaling factor in y direction
         :return:
         """
+        # Delete the old analysis and all it's component objects
+        op.wipeAnalysis()
+
         w1 = self.omegas[0]
         w2 = self.omegas[1]
         a0 = 2 * w1 * w2 / (w2 ** 2 - w1 ** 2) * (w2 * self.xi - w1 * self.xi)
@@ -230,20 +237,30 @@ class IDA_HTF:
         # Rayleigh damping
         op.rayleigh(a0, 0.0, 0.0, a1)
         op.timeSeries('Path', self.TSTAGX, '-dt', dt, '-filePath', str(pathx), '-factor', fx)
-        # op.timeSeries('Path', self.TSTAGY, '-dt', dt, '-filePath', str(pathy), '-factor', fy)
+        op.timeSeries('Path', self.TSTAGY, '-dt', dt, '-filePath', str(pathy), '-factor', fy)
         op.pattern('UniformExcitation', self.PTAGX, 1, '-accel', self.TSTAGX)
+        if self.flag3d:
+            op.pattern('UniformExcitation', self.PTAGY, 2, '-accel', self.TSTAGY)
 
-        # Delete the old analysis and all it's component objects
-        op.wipeAnalysis()
-        op.constraints('Plain')
-        op.numberer('Plain')
+        if self.flag3d:
+            op.constraints('Penalty', 1.0e15, 1.0e15)
+            # op.constraints("Transformation")
+        else:
+            op.constraints('Plain')
+        op.numberer('RCM')
         op.system('UmfPack')
 
-    def establish_im(self):
+    def establish_im(self, output_dir=None):
         """
         Establishes IM and performs analyses
+        :param output_dir: str              Outputs directory
         :return: None
         """
+        if os.path.exists(output_dir.parents[0] / "IM.csv"):
+            im_filename = output_dir.parents[0] / "IM_temp.csv"
+        else:
+            im_filename = output_dir.parents[0] / "IM.csv"
+
         # Get the ground motion set information
         eqnms_list_x, eqnms_list_y, dts_list, durs_list = self.get_gm()
         nrecs = len(dts_list)
@@ -273,10 +290,18 @@ class IDA_HTF:
 
             elif self.IM_type == 2:
                 print('[IDA] IM is Sa at a specified period')
-                Tcond = self.T_info
-                sd, sv, sa = self.get_IM(eq_name_x, dts_list[rec], Tcond, self.xi)
+                if self.flag3d:
+                    Tcond_x = self.T_info[0]
+                    Tcond_y = self.T_info[1]
+                else:
+                    if isinstance(self.T_info, float):
+                        Tcond_x = Tcond_y = self.T_info
+                    else:
+                        Tcond_x = Tcond_y = self.T_info[0]
+
+                sd, sv, sa = self.get_IM(eq_name_x, dts_list[rec], Tcond_x, self.xi)
                 IMx = sa
-                sd, sv, sa = self.get_IM(eq_name_y, dts_list[rec], Tcond, self.xi)
+                sd, sv, sa = self.get_IM(eq_name_y, dts_list[rec], Tcond_y, self.xi)
                 IMy = sa
                 # Get the geometric mean
                 IM_geomean = np.power(IMx * IMy, 0.5)
@@ -297,7 +322,7 @@ class IDA_HTF:
             while j <= self.max_runs:
                 # As long as hunting flag is 1, meaning that collapse have not been reached
                 if hflag == 1:
-                    print("[STEP] We join the hunt...")
+                    print("[STEP] Gehrman joins the hunt...")
                     # Determine the intensity to run at during the hunting
                     if j == 1:
                         # First IM
@@ -324,9 +349,15 @@ class IDA_HTF:
                     th = SolutionAlgorithm(self.dt, dur, self.dcap, m.g.tnode, m.g.bnode, self.pflag, self.flag3d)
                     self.outputs[rec][j] = th.ntha_results
 
+                    # Export results at each run
+                    if self.export_at_each_step:
+                        with open(output_dir / f"Record{rec + 1}_Run{j}.pickle", "wb") as handle:
+                            pickle.dump(self.outputs[rec][j], handle)
+                        np.savetxt(im_filename, self.IM_output, delimiter=',')
+
                     # Check the hunted run for collapse
                     """
-                    c_index = -1                Analysis failed to converge at controltime of Tmax
+                    c_index = -1                Analysis failed to converge at control time of Tmax
                     c_index = 0                 Analysis completed successfully
                     c_index = 1                 Local structure collapse
                     """
@@ -357,17 +388,17 @@ class IDA_HTF:
                         # Remove that value of IM from the array
                         IM[j - 1] = 0.0
 
-                    # Determine the difference between the hunting's noncollapse and collapse IM
+                    # Determine the difference between the hunting's non-collapse and collapse IM
                     diff = firstC - IM[j - 2]
 
-                    # Take 0.2 of the difference
+                    # Take 20% of the difference
                     inctr = 0.2 * diff
 
                     # Place a lower threshold on the increment so it doesnt start tracing too fine
                     if inctr < 0.05:
                         inctr = 0.025
 
-                    # Calculate new tracing IM, which is previous noncollapse plus increment
+                    # Calculate new tracing IM, which is previous non-collapse plus increment
                     IMtr = IM[j - 2] + inctr
 
                     IM[j - 1] = IMtr
@@ -385,6 +416,12 @@ class IDA_HTF:
 
                     th = SolutionAlgorithm(self.dt, dur, self.dcap, m.g.tnode, m.g.bnode, self.pflag, self.flag3d)
                     self.outputs[rec][j] = th.ntha_results
+
+                    # Export results at each run
+                    if self.export_at_each_step:
+                        with open(output_dir / f"Record{rec + 1}_Run{j}.pickle", "wb") as handle:
+                            pickle.dump(self.outputs[rec][j], handle)
+                        np.savetxt(im_filename, self.IM_output, delimiter=',')
 
                     if th.c_index > 0:
                         # Stop tracing
@@ -411,6 +448,7 @@ class IDA_HTF:
                     # Determine the biggest gap in IM for the hunted runs
                     gap = 0.0
                     IMfil = 0.0
+
                     '''We go to the end of the list minus 1 because, if not we would be filling between a noncollapsing
                     and a collapsing run, for which we are not sure if that filling run would be a non collapse -
                     In short, does away with collapsing fills'''
@@ -439,6 +477,12 @@ class IDA_HTF:
 
                     th = SolutionAlgorithm(self.dt, dur, self.dcap, m.g.tnode, m.g.bnode, self.pflag, self.flag3d)
                     self.outputs[rec][j] = th.ntha_results
+
+                    # Export results at each run
+                    if self.export_at_each_step:
+                        with open(output_dir / f"Record{rec + 1}_Run{j}.pickle", "wb") as handle:
+                            pickle.dump(self.outputs[rec][j], handle)
+                        np.savetxt(im_filename, self.IM_output, delimiter=',')
 
                     # Increment run number
                     j += 1

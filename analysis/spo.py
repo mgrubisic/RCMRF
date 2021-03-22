@@ -6,7 +6,7 @@ import numpy as np
 
 
 class SPO:
-    def __init__(self, cntr_node, disp_dir, base_cols, dref=1.0, nstep=2000):
+    def __init__(self, cntr_node, disp_dir, base_cols, dref=1.0, nstep=1000, flag3d=False, direction=0):
         """
         Initialize static pushover definition
         :param cntr_node: int                       Node to control with displacement integrator
@@ -15,18 +15,23 @@ class SPO:
         :param dref: float                          Reference displacement to which cycles are run. Corresponds to yield
                                                     or equivalent other, such as 1mm (in m)
         :param nstep: int                           Number of steps
+        :param flag3d: bool                         True for 3D modelling, False for 2D modelling
+        :param direction: int
         """
         self.TOL = 1e-08
-        self.ITERINIT = 50
+        self.ITERINIT = 10
         self.dref = dref
         self.cntr_node = cntr_node
         self.disp_dir = disp_dir
         self.nstep = nstep
         self.base_cols = base_cols
-        self.TEST_TYPE = 'NormDispIncr'
+        self.flag3d = flag3d
+        self.direction = direction
+        self.TEST_TYPE = 'NormDispIncr' if not self.flag3d else 'EnergyIncr'
         self.ALGORITHM_TYPE = 'KrylovNewton'
+        self.NEGLIGIBLE = 1e-09
 
-    def load_pattern(self, nodes, load_pattern=2, heights=None, mode_shape=None):
+    def load_pattern(self, nodes, load_pattern=2, heights=None, mode_shape=None, nbays_x=None, nbays_y=None):
         """
         Define the load pattern
         :param nodes: list(int)                     Nodes (rightmost nodes) to which load pattern is applied to
@@ -36,6 +41,8 @@ class SPO:
                                                     2 = First-mode proportional pattern
         :param heights: list                        Storey heights (compatible with 1st load pattern)
         :param mode_shape: list                     1st mode shape (compatible with 2nd load pattern)
+        :param nbays_x: int
+        :param nbays_y: int
         :return: None
         """
         loads = []
@@ -48,7 +55,7 @@ class SPO:
             print('[STEP] Applying triangular load pattern...')
             for h in range(len(heights)):
                 if heights[h] != 0.0:
-                    loads.append(heights[h] / sum(heights[:h]))
+                    loads.append(heights[h] / heights[-1])
 
         elif load_pattern == 2:
             print('[STEP] Applying 1st mode proportional load pattern...')
@@ -60,21 +67,50 @@ class SPO:
 
         op.timeSeries('Linear', 4)
         op.pattern('Plain', 400, 4)
-        for fpush, nodepush in zip(loads, nodes):
-            op.load(nodepush, fpush, 0.0, 0.0)
+        if self.flag3d:
+            # Number of stories
+            nst = len(heights) - 1
+            # Number of nodes
+            n_nodes = (nbays_y + 1) * (nbays_x + 1)
 
-    def set_analysis(self):
+            # Pushing all nodes with masses assigned to them
+            for xbay in range(1, nbays_x + 2):
+                for ybay in range(1, nbays_y + 2):
+                    for st in range(1, nst + 1):
+                        nodepush = int(f"{xbay}{ybay}{st}")
+                        fpush = loads[st - 1]
+                        if self.direction == 0:
+                            op.load(nodepush, fpush, self.NEGLIGIBLE, self.NEGLIGIBLE, self.NEGLIGIBLE,
+                                    self.NEGLIGIBLE, self.NEGLIGIBLE)
+                        else:
+                            op.load(nodepush, self.NEGLIGIBLE, fpush, self.NEGLIGIBLE, self.NEGLIGIBLE,
+                                    self.NEGLIGIBLE, self.NEGLIGIBLE)
+
+        else:
+            for fpush, nodepush in zip(loads, nodes):
+                if self.flag3d:
+                    op.load(nodepush, fpush, self.NEGLIGIBLE, self.NEGLIGIBLE, self.NEGLIGIBLE, self.NEGLIGIBLE,
+                            self.NEGLIGIBLE)
+                else:
+                    op.load(nodepush, fpush, self.NEGLIGIBLE, self.NEGLIGIBLE)
+
+    def set_analysis(self, heights):
         """
         Sets up the initial analysis parameters
+        :param heights: list
         :return: None
         """
         print('[INITIALIZE] Static pushover analysis has commenced...')
-        op.constraints('Plain')
+        if self.flag3d:
+            op.constraints("Penalty", 1e15, 1e15)
+            op.system('UmfPack')
+        else:
+            op.constraints('Plain')
+            op.system('BandGeneral')
         op.numberer('RCM')
-        op.system('BandGeneral')
         op.test(self.TEST_TYPE, self.TOL, self.ITERINIT)
         op.algorithm(self.ALGORITHM_TYPE)
-        op.integrator('DisplacementControl', self.cntr_node, self.disp_dir, self.dref / self.nstep)
+        op.integrator('DisplacementControl', self.cntr_node, self.disp_dir, 0.1 * heights[-1] / self.nstep)
         op.analysis('Static')
 
     def seek_solution(self):
@@ -82,6 +118,9 @@ class SPO:
         Searches for a solution by using different test conditions or algorithms
         :return: ndarrays                           Top displacement vs Base shear
         """
+        # It happens so, that column shear ID matches the disp_dir ID, they are not the same thing
+        col_shear_idx = self.disp_dir
+
         '''Seek for a solution using different test conditions or algorithms'''
         # Set the initial values to start the while loop
         # The feature of disabling the possibility of having a negative loading has been included.
@@ -94,7 +133,7 @@ class SPO:
         topDisp = np.array([op.nodeResponse(self.cntr_node, self.disp_dir, 1)])
         baseShear = np.array([0.0])
         for col in self.base_cols:
-            baseShear[0] += op.eleForce(int(col), 1)
+            baseShear[0] += op.eleForce(int(col), col_shear_idx)
 
         while step <= self.nstep and ok == 0 and loadf > 0:
             ok = op.analyze(1)
@@ -134,7 +173,7 @@ class SPO:
             topDisp = np.append(topDisp, op.nodeResponse(self.cntr_node, self.disp_dir, 1))
             eleForceTemp = 0.0
             for col in self.base_cols:
-                eleForceTemp += op.eleForce(int(col), 1)
+                eleForceTemp += op.eleForce(int(col), col_shear_idx)
             baseShear = np.append(baseShear, eleForceTemp)
 
             loadf = op.getTime()

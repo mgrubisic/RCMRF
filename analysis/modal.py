@@ -16,12 +16,12 @@ class Modal:
         self.num_modes = num_modes
         self.damp_modes = damp_modes
         self.damping = damping
-        lam = self.get_lambda()
+        lam = self.compute_eigenvectors()
         self.record_stuff()
         self.omega, self.freq, self.period = self.extract_eigenvalues(lam)
         self.xi_modes = self.get_damping(self.omega)
 
-    def get_lambda(self):
+    def compute_eigenvectors(self):
         """
         Computes eigen values
         :return: float                          Eigenvalue
@@ -44,8 +44,7 @@ class Modal:
                     except:
                         print('[EXCEPTION] Eigensolver failed.')
 
-        else:
-            return lam
+        return lam
 
     @staticmethod
     def record_stuff():
